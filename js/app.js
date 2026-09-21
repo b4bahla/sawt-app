@@ -14,7 +14,7 @@ import {
 import { summarize } from "./summarize.js";
 import { buildDocument, toDocx, toPDF, toMarkdown, toPlainText, deliver, shareText, safeFileName } from "./export.js";
 
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
@@ -31,26 +31,43 @@ function markModelReady(key) { try { localStorage.setItem("sawt-model-" + key, "
 
 // ---------- worker ----------
 
-const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+// iPadOS reports itself as a Mac; touch support gives it away.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+
+let worker = null;
 let rpcSeq = 0;
 const rpcs = new Map();
 let onModelProgress = null;
-worker.onmessage = (e) => {
-  const msg = e.data;
-  if (msg.type === "progress") { onModelProgress?.(msg); return; }
-  const rpc = rpcs.get(msg.id);
-  if (!rpc) return;
-  rpcs.delete(msg.id);
-  msg.ok ? rpc.resolve(msg.result) : rpc.reject(new Error(msg.error));
-};
 // A worker that fails to load would otherwise leave every call waiting
 // forever, which is exactly how the first test run of this app hung silently.
 let workerFailure = null;
-worker.onerror = (e) => {
-  workerFailure = new Error("The transcription engine could not start (" + (e.message || "script error") + "). Reload the app; if it persists, delete and re-add it to the Home Screen.");
-  for (const rpc of rpcs.values()) rpc.reject(workerFailure);
+
+function startWorker() {
+  worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  workerFailure = null;
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === "progress") { onModelProgress?.(msg); return; }
+    const rpc = rpcs.get(msg.id);
+    if (!rpc) return;
+    rpcs.delete(msg.id);
+    msg.ok ? rpc.resolve(msg.result) : rpc.reject(new Error(msg.error));
+  };
+  worker.onerror = (e) => {
+    workerFailure = new Error("The transcription engine could not start (" + (e.message || "script error") + "). Reload the app; if it persists, delete and re-add it to the Home Screen.");
+    for (const rpc of rpcs.values()) rpc.reject(workerFailure);
+    rpcs.clear();
+  };
+}
+
+/** Replaces a stuck worker. Its model files stay cached, so nothing is downloaded again. */
+function restartWorker(reason) {
+  worker?.terminate();
+  for (const rpc of rpcs.values()) rpc.reject(reason);
   rpcs.clear();
-};
+  startWorker();
+}
+startWorker();
 
 function call(type, data = {}, transfer = []) {
   if (workerFailure) return Promise.reject(workerFailure);
@@ -154,13 +171,41 @@ async function runSetup() {
     $("#setup-go").disabled = true;
     $("#setup-error").hidden = true;
     $("#setup-progress").hidden = false;
-    onModelProgress = ({ loaded, total }) => {
-      $("#setup-fill").style.width = Math.round((loaded / total) * 100) + "%";
-      $("#setup-status").textContent = `Downloading · ${(loaded / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB`;
-    };
+    // Building the model after the download can take a while on a phone, and
+    // if Safari stalls it nothing ever reports back. So the stage is shown,
+    // and a watchdog turns silence into an error the user can act on.
+    const PREPARE_LIMIT_MS = 4 * 60 * 1000;
+    let watchdog = null, preparingSince = 0, ticker = null;
+    const stall = new Promise((_, reject) => {
+      const arm = () => {
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => reject(new Error("Preparing the model stopped responding.")), PREPARE_LIMIT_MS);
+      };
+      arm();
+      onModelProgress = (p) => {
+        if (p.stage === "preparing") {
+          if (!preparingSince) {
+            preparingSince = Date.now();
+            $("#setup-fill").style.width = "100%";
+            const show = () => {
+              const s = Math.round((Date.now() - preparingSince) / 1000);
+              $("#setup-status").textContent = `Download complete. Preparing the model on this iPhone… ${s}s (usually under a minute)`;
+            };
+            show();
+            ticker = setInterval(show, 1000);
+          }
+          arm();
+          return;
+        }
+        arm();
+        $("#setup-fill").style.width = Math.round((p.loaded / p.total) * 100) + "%";
+        $("#setup-status").textContent = `Downloading · ${(p.loaded / 1e6).toFixed(0)} of ${(p.total / 1e6).toFixed(0)} MB`;
+      };
+    });
+    stall.catch(() => {});
     try {
-      await call("set-model", { model: choice });
-      await call("load-asr", { model: choice });
+      await call("set-model", { model: choice, ios: IOS });
+      await Promise.race([call("load-asr", { model: choice }), stall]);
       markModelReady(choice);
       navigator.storage?.persist?.();
       $("#setup").hidden = true;
@@ -168,11 +213,19 @@ async function runSetup() {
       showView("notes");
       kickQueue();
     } catch (err) {
-      $("#setup-error").textContent = "The download did not finish: " + err.message + " Check the connection and try again.";
+      const stalled = /stopped responding/.test(err.message);
+      if (stalled) restartWorker(err);
+      $("#setup-error").textContent = stalled
+        ? "The model downloaded, but this iPhone did not finish preparing it. Tap Try again (nothing is downloaded twice). If it happens again, choose Light, which needs far less memory."
+        : preparingSince
+          ? "The model downloaded but could not be loaded: " + err.message + " Try again, or choose Light."
+          : "The download did not finish: " + err.message + " Check the connection and try again.";
       $("#setup-error").hidden = false;
       $("#setup-go").disabled = false;
       $("#setup-go").textContent = "Try again";
     } finally {
+      clearTimeout(watchdog);
+      clearInterval(ticker);
       onModelProgress = null;
     }
   };
@@ -781,7 +834,7 @@ $("#set-language").addEventListener("change", (e) => { prefs.language = e.target
 $("#set-summary-lang").addEventListener("change", (e) => { prefs.summaryLang = e.target.value; savePrefs(); });
 $("#set-model").addEventListener("change", async (e) => {
   prefs.model = e.target.value; savePrefs();
-  await call("set-model", { model: prefs.model });
+  await call("set-model", { model: prefs.model, ios: IOS });
   if (needsSetup()) runSetup();
 });
 $("#set-clear-models").addEventListener("click", async () => {
@@ -798,7 +851,7 @@ $("#set-clear-models").addEventListener("click", async () => {
 async function start() {
   setPolicyUI(prefs.policy);
   $("#rec-language").value = prefs.language;
-  await call("set-model", { model: prefs.model });
+  await call("set-model", { model: prefs.model, ios: IOS });
   const recovered = await db.recoverInterrupted();
   // A note still marked "recording" belongs to a closed tab: its chunks are
   // saved, so it simply continues as a transcription.

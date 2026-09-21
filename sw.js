@@ -5,7 +5,7 @@
 // Model weights are not cached here; transformers.js keeps them in its own
 // Cache Storage entry ("transformers-cache"), which this worker never touches.
 
-const VERSION = "sawt-shell-v1.1.1";
+const VERSION = "sawt-shell-v1.1.2";
 const SHELL = [
   "./",
   "./index.html",

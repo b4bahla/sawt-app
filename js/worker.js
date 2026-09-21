@@ -10,9 +10,16 @@ env.useBrowserCache = true;
 env.useWasmCache = true;
 // Multithreaded WASM needs cross-origin isolation, which the service worker
 // provides. Without it, ONNX Runtime quietly falls back to one thread.
-if (self.crossOriginIsolated) {
-  env.backends.onnx.wasm.numThreads = Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
+// On iPhone and iPad, threaded ONNX Runtime can stall while it builds the
+// session (threads are spawned as workers nested inside this worker), so iOS
+// runs single-threaded: slower, but it always finishes.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+function configureThreads(ios) {
+  env.backends.onnx.wasm.numThreads = ios || !self.crossOriginIsolated
+    ? 1
+    : Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
 }
+configureThreads(IOS);
 
 const MODELS = {
   light: { id: "onnx-community/whisper-base", label: "Light", mb: 77 },
@@ -29,6 +36,9 @@ function progress(kind) {
       let loaded = 0, total = 0;
       for (const f of files.values()) { loaded += f.loaded; total += f.total; }
       self.postMessage({ type: "progress", kind, loaded, total });
+    } else if (p.status === "done" && files.size && [...files.values()].every((f) => f.loaded >= f.total)) {
+      // Every file is here; what follows is building the model in memory.
+      self.postMessage({ type: "progress", kind, stage: "preparing" });
     }
   };
 }
@@ -80,7 +90,7 @@ async function handle(e) {
   try {
     let result;
     switch (type) {
-      case "set-model": currentModel = e.data.model; result = true; break;
+      case "set-model": currentModel = e.data.model; if (e.data.ios) configureThreads(true); result = true; break;
       case "load-asr": await loadASR(e.data.model || currentModel); result = true; break;
       case "transcribe": result = await transcribe(e.data); break;
       case "unload": await disposeASR(); result = true; break;
