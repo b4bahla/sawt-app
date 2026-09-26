@@ -26,7 +26,24 @@ const MODELS = {
   standard: { id: "onnx-community/whisper-small", label: "Standard", mb: 250 },
 };
 
-let asr = null, asrId = null;
+let asr = null, asrKey = null, asrPlan = -1, asrLabel = "";
+
+/**
+ * Ways to run a model, best first. On an iPhone the 250 MB Standard model can
+ * exhaust Safari's WASM heap while the session is built, which looks like a
+ * freeze with no error, so the GPU is tried first: its weights live in GPU
+ * memory instead. Each plan is attempted in turn until one loads.
+ */
+function plansFor(key, gpu) {
+  const cpu = { label: "CPU", device: "wasm", dtype: { encoder_model: "q8", decoder_model_merged: "q8" } };
+  const webgpu = { label: "GPU", device: "webgpu", dtype: { encoder_model: "fp16", decoder_model_merged: "q4" } };
+  if (key === "standard") return gpu ? [webgpu, cpu] : [cpu];
+  return gpu ? [cpu, webgpu] : [cpu];
+}
+
+async function gpuAvailable() {
+  try { return !!navigator.gpu && !!(await navigator.gpu.requestAdapter()); } catch { return false; }
+}
 
 function progress(kind) {
   const files = new Map();
@@ -44,25 +61,40 @@ function progress(kind) {
 }
 
 async function disposeASR() {
-  if (asr) { try { await asr.dispose(); } catch {} asr = null; asrId = null; }
+  if (asr) { try { await asr.dispose(); } catch {} asr = null; asrKey = null; asrPlan = -1; asrLabel = ""; }
 }
 
-async function loadASR(key) {
-  const model = MODELS[key];
-  if (asr && asrId === model.id) return asr;
+/**
+ * Loads `key`, starting at plan `from`. Returns which plan worked, so the app
+ * can remember it and so a plan that hung can be skipped on the next attempt.
+ */
+async function loadASR(key, from = 0) {
+  if (asr && asrKey === key && asrPlan >= from) return { plan: asrPlan, label: asrLabel };
   await disposeASR();
-  // 8-bit weights on WASM: the combination that loads reliably in Safari.
-  asr = await pipeline("automatic-speech-recognition", model.id, {
-    dtype: { encoder_model: "q8", decoder_model_merged: "q8" },
-    device: "wasm",
-    progress_callback: progress("asr"),
-  });
-  asrId = model.id;
-  return asr;
+  const plans = plansFor(key, await gpuAvailable());
+  let last = null;
+  for (let i = Math.max(0, from); i < plans.length; i++) {
+    const plan = plans[i];
+    self.postMessage({ type: "progress", kind: "asr", stage: "attempt", label: plan.label, index: i, of: plans.length });
+    try {
+      asr = await pipeline("automatic-speech-recognition", MODELS[key].id, {
+        dtype: plan.dtype,
+        device: plan.device,
+        progress_callback: progress("asr"),
+      });
+      asrKey = key; asrPlan = i; asrLabel = plan.label;
+      return { plan: i, label: plan.label };
+    } catch (err) {
+      last = err;
+      await disposeASR();
+    }
+  }
+  throw last || new Error("No way to run this model on this device.");
 }
 
 async function transcribe({ audio, language }) {
-  const pipe = await loadASR(currentModel);
+  await loadASR(currentModel, currentPlan);
+  const pipe = asr;
   const options = { return_timestamps: true, task: "transcribe" };
   // Leaving language unset lets Whisper predict the language token itself,
   // which is the right behaviour for bilingual speakers.
@@ -78,7 +110,7 @@ async function transcribe({ audio, language }) {
   }));
 }
 
-let currentModel = "standard";
+let currentModel = "standard", currentPlan = 0;
 
 // Requests run strictly one after another. Handlers are async, so without this
 // a model switch could dispose Whisper while a transcription was mid-run.
@@ -90,8 +122,13 @@ async function handle(e) {
   try {
     let result;
     switch (type) {
-      case "set-model": currentModel = e.data.model; if (e.data.ios) configureThreads(true); result = true; break;
-      case "load-asr": await loadASR(e.data.model || currentModel); result = true; break;
+      case "set-model":
+        currentModel = e.data.model;
+        currentPlan = e.data.plan || 0;
+        if (e.data.ios) configureThreads(true);
+        result = true;
+        break;
+      case "load-asr": result = await loadASR(e.data.model || currentModel, e.data.plan || 0); break;
       case "transcribe": result = await transcribe(e.data); break;
       case "unload": await disposeASR(); result = true; break;
       default: throw new Error("Unknown request " + type);

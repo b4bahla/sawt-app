@@ -38,8 +38,9 @@
           <div class="bar"><div class="fill" id="setup-fill"></div></div>
           <p class="hint" id="setup-status">Starting…</p>
         </div>
-        <p class="error" id="setup-error" hidden></p>
+        <div class="error" id="setup-error" hidden></div>
         <button class="primary wide" id="setup-go">Download and continue</button>
+        <p class="foot" id="setup-version"></p>
         <p class="hint center">Use Wi-Fi if you can. If the download is interrupted, it picks up again next time.</p>
       </div>
     </section>
@@ -81,7 +82,8 @@
             </select>
           </label>
           <button id="rec-start" class="rec-button" aria-label="Start recording"></button>
-          <p class="hint center">Keep Sawt open on screen while recording. iPhone stops the microphone for web apps in the background.</p>
+          <p class="hint center">Keep Sawt open on screen while recording. Apple stops the microphone for web apps once the screen locks or you switch apps.</p>
+          <p class="hint center">For a meeting where the screen must be off, record it with the iPhone’s Voice Memos, then import the file below. Whatever was captured before an interruption is always kept.</p>
           <label class="import-button">
             <input type="file" id="import-input" accept="audio/*,video/*,.m4a,.mp3,.wav,.mp4,.mov" hidden>
             Import a recording or video

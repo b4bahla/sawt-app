@@ -14,7 +14,7 @@ import {
 import { summarize } from "./summarize.js";
 import { buildDocument, toDocx, toPDF, toMarkdown, toPlainText, deliver, shareText, safeFileName } from "./export.js";
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
@@ -28,6 +28,9 @@ const prefs = (() => {
 function savePrefs() { try { localStorage.setItem("sawt-prefs", JSON.stringify(prefs)); } catch {} }
 function modelReady(key) { try { return localStorage.getItem("sawt-model-" + key) === "ready"; } catch { return false; } }
 function markModelReady(key) { try { localStorage.setItem("sawt-model-" + key, "ready"); } catch {} }
+// Which way of running the model worked here, so later sessions skip the rest.
+function savePlan(key, plan) { try { localStorage.setItem("sawt-plan-" + key, String(plan)); } catch {} }
+function loadPlan(key) { try { return Number(localStorage.getItem("sawt-plan-" + key)) || 0; } catch { return 0; } }
 
 // ---------- worker ----------
 
@@ -165,70 +168,107 @@ async function runSetup() {
   for (const v of ["notes", "record", "settings"]) $("#view-" + v).hidden = true;
   const radios = $$('input[name="setup-model"]');
   radios.forEach((r) => (r.checked = r.value === prefs.model));
-  $("#setup-go").onclick = async () => {
-    const choice = radios.find((r) => r.checked)?.value || "standard";
-    prefs.model = choice; savePrefs();
-    $("#setup-go").disabled = true;
-    $("#setup-error").hidden = true;
-    $("#setup-progress").hidden = false;
-    // Building the model after the download can take a while on a phone, and
-    // if Safari stalls it nothing ever reports back. So the stage is shown,
-    // and a watchdog turns silence into an error the user can act on.
-    const PREPARE_LIMIT_MS = 4 * 60 * 1000;
-    let watchdog = null, preparingSince = 0, ticker = null;
-    const stall = new Promise((_, reject) => {
-      const arm = () => {
-        clearTimeout(watchdog);
-        watchdog = setTimeout(() => reject(new Error("Preparing the model stopped responding.")), PREPARE_LIMIT_MS);
-      };
-      arm();
-      onModelProgress = (p) => {
-        if (p.stage === "preparing") {
-          if (!preparingSince) {
-            preparingSince = Date.now();
-            $("#setup-fill").style.width = "100%";
-            const show = () => {
-              const s = Math.round((Date.now() - preparingSince) / 1000);
-              $("#setup-status").textContent = `Download complete. Preparing the model on this iPhone… ${s}s (usually under a minute)`;
-            };
-            show();
-            ticker = setInterval(show, 1000);
-          }
-          arm();
-          return;
-        }
-        arm();
-        $("#setup-fill").style.width = Math.round((p.loaded / p.total) * 100) + "%";
-        $("#setup-status").textContent = `Downloading · ${(p.loaded / 1e6).toFixed(0)} of ${(p.total / 1e6).toFixed(0)} MB`;
-      };
-    });
-    stall.catch(() => {});
-    try {
-      await call("set-model", { model: choice, ios: IOS });
-      await Promise.race([call("load-asr", { model: choice }), stall]);
-      markModelReady(choice);
-      navigator.storage?.persist?.();
-      $("#setup").hidden = true;
-      $("#tabbar").hidden = false;
-      showView("notes");
-      kickQueue();
-    } catch (err) {
-      const stalled = /stopped responding/.test(err.message);
-      if (stalled) restartWorker(err);
-      $("#setup-error").textContent = stalled
-        ? "The model downloaded, but this iPhone did not finish preparing it. Tap Try again (nothing is downloaded twice). If it happens again, choose Light, which needs far less memory."
-        : preparingSince
-          ? "The model downloaded but could not be loaded: " + err.message + " Try again, or choose Light."
-          : "The download did not finish: " + err.message + " Check the connection and try again.";
-      $("#setup-error").hidden = false;
-      $("#setup-go").disabled = false;
-      $("#setup-go").textContent = "Try again";
-    } finally {
+  $("#setup-version").textContent = "Version " + VERSION;
+  $("#setup-go").onclick = () => attemptSetup(radios.find((r) => r.checked)?.value || "standard", 0);
+}
+
+/**
+ * Loads a model, starting from plan `from`.
+ *
+ * Preparing a 250 MB model can take a while on a phone and, on an iPhone, can
+ * also stall outright with no error at all. So the stage is always visible, a
+ * watchdog turns silence into a real failure, and a stall moves on to the next
+ * way of running the model rather than leaving the user on a dead screen.
+ */
+async function attemptSetup(choice, from) {
+  const PREPARE_LIMIT_MS = 3 * 60 * 1000;
+  prefs.model = choice; savePrefs();
+  $("#setup-go").disabled = true;
+  $("#setup-error").hidden = true;
+  $("#setup-progress").hidden = false;
+
+  let watchdog = null, ticker = null, preparingSince = 0, plan = from, planLabel = "";
+  const stall = new Promise((_, reject) => {
+    const arm = () => {
       clearTimeout(watchdog);
+      watchdog = setTimeout(() => reject(new Error("STALL")), PREPARE_LIMIT_MS);
+    };
+    const describe = () => {
+      const secs = Math.round((Date.now() - preparingSince) / 1000);
+      const how = planLabel === "GPU" ? "using the graphics chip" : "";
+      $("#setup-status").textContent = `Download complete. Preparing the model ${how}… ${secs}s`;
+    };
+    arm();
+    onModelProgress = (p) => {
+      arm();
+      if (p.stage === "attempt") {
+        plan = p.index; planLabel = p.label;
+        preparingSince = 0;
+        clearInterval(ticker);
+        if (p.index > 0) $("#setup-status").textContent = "Trying another way to run the model…";
+        return;
+      }
+      if (p.stage === "preparing") {
+        if (!preparingSince) {
+          preparingSince = Date.now();
+          $("#setup-fill").style.width = "100%";
+          describe();
+          ticker = setInterval(describe, 1000);
+        }
+        return;
+      }
       clearInterval(ticker);
-      onModelProgress = null;
+      preparingSince = 0;
+      $("#setup-fill").style.width = Math.round((p.loaded / p.total) * 100) + "%";
+      $("#setup-status").textContent = `Downloading · ${(p.loaded / 1e6).toFixed(0)} of ${(p.total / 1e6).toFixed(0)} MB`;
+    };
+  });
+  stall.catch(() => {});
+
+  try {
+    await call("set-model", { model: choice, ios: IOS, plan: from });
+    const chosen = await Promise.race([call("load-asr", { model: choice, plan: from }), stall]);
+    savePlan(choice, chosen?.plan || 0);
+    markModelReady(choice);
+    navigator.storage?.persist?.();
+    $("#setup").hidden = true;
+    $("#tabbar").hidden = false;
+    showView("notes");
+    kickQueue();
+  } catch (err) {
+    const stalled = err.message === "STALL";
+    if (stalled) restartWorker(err);
+    // A stall says nothing about the next way of running the model, so try it.
+    if (stalled && plan + 1 < 2 && choice === "standard") {
+      clearTimeout(watchdog); clearInterval(ticker); onModelProgress = null;
+      $("#setup-status").textContent = "That method did not respond. Trying another…";
+      return attemptSetup(choice, plan + 1);
     }
-  };
+    setupFailed(choice, stalled, err, preparingSince > 0);
+  } finally {
+    clearTimeout(watchdog);
+    clearInterval(ticker);
+    onModelProgress = null;
+  }
+}
+
+function setupFailed(choice, stalled, err, wasPreparing) {
+  const box = $("#setup-error");
+  box.textContent = "";
+  const line = stalled
+    ? "The model downloaded, but this iPhone could not finish preparing it."
+    : wasPreparing
+      ? "The model downloaded, but could not be loaded on this iPhone."
+      : "The download did not finish. Check the connection and try again.";
+  box.append(el("p", {}, line));
+  if (choice === "standard") {
+    box.append(el("p", {}, "Light needs far less memory and works on every iPhone. You can switch back to Standard later in Settings."),
+      el("button", { class: "primary", onclick: () => attemptSetup("light", 0) }, "Use Light instead"));
+  }
+  box.append(el("p", { class: "foot" }, "Details: " + (err.message === "STALL" ? "preparing timed out" : err.message)));
+  box.hidden = false;
+  $("#setup-go").disabled = false;
+  $("#setup-go").textContent = "Try again";
 }
 
 // ---------- notes list ----------
@@ -834,7 +874,7 @@ $("#set-language").addEventListener("change", (e) => { prefs.language = e.target
 $("#set-summary-lang").addEventListener("change", (e) => { prefs.summaryLang = e.target.value; savePrefs(); });
 $("#set-model").addEventListener("change", async (e) => {
   prefs.model = e.target.value; savePrefs();
-  await call("set-model", { model: prefs.model, ios: IOS });
+  await call("set-model", { model: prefs.model, ios: IOS, plan: loadPlan(prefs.model) });
   if (needsSetup()) runSetup();
 });
 $("#set-clear-models").addEventListener("click", async () => {
@@ -851,7 +891,7 @@ $("#set-clear-models").addEventListener("click", async () => {
 async function start() {
   setPolicyUI(prefs.policy);
   $("#rec-language").value = prefs.language;
-  await call("set-model", { model: prefs.model, ios: IOS });
+  await call("set-model", { model: prefs.model, ios: IOS, plan: loadPlan(prefs.model) });
   const recovered = await db.recoverInterrupted();
   // A note still marked "recording" belongs to a closed tab: its chunks are
   // saved, so it simply continues as a transcription.
